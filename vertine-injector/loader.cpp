@@ -1,8 +1,15 @@
 #include "loader.hpp"
+#include <unordered_map>
+#include <iostream>
+#include <sstream>
 
-static jclass class_to_transform = nullptr;
-static unsigned char* class_bytes;
-static int class_bytes_len;
+struct retransform_callback {
+	const unsigned char* class_data;
+	jint class_data_len;
+	bool success;
+};
+
+static std::unordered_map<jclass, retransform_callback*> callback_map;
 
 void JNICALL classFileLoadHook(jvmtiEnv* jvmti_env, JNIEnv* env,
 	jclass class_being_redefined, jobject loader,
@@ -12,33 +19,22 @@ void JNICALL classFileLoadHook(jvmtiEnv* jvmti_env, JNIEnv* env,
 
 	*new_class_data = NULL;
 
-	if (class_to_transform && class_being_redefined && env->IsSameObject(class_being_redefined, class_to_transform))
+	if (class_being_redefined)
 	{
-		class_bytes = (unsigned char*)class_data;
-		class_bytes_len = class_data_len;
+
+		for (auto const& [clazz, retransform_callback] : callback_map)
+		{
+			if (!env->IsSameObject(clazz, class_being_redefined))
+			{
+				continue;
+			}
+
+			callback_map.erase(callback_map.find(clazz));
+			retransform_callback->class_data = class_data;
+			retransform_callback->class_data_len = class_data_len;
+			break;
+		}
 	}
-}
-
-JNIEXPORT jbyteArray JNICALL GetClassBytes(JNIEnv* env, jclass _, jclass clazz)
-{
-	class_to_transform = clazz;
-	class_bytes = nullptr;
-
-	jclass* classes = (jclass*)malloc(sizeof(jclass));
-	classes[0] = clazz;
-
-	client->jvmti->RetransformClasses(1, classes);
-
-	while (!class_bytes)
-	{
-		continue;
-	}
-
-	jbyteArray outputArray = env->NewByteArray(class_bytes_len);
-	env->SetByteArrayRegion(outputArray, 0, class_bytes_len, (jbyte*)class_bytes);
-
-	free(classes);
-	return outputArray;
 }
 
 void* allocate(jlong size) {
@@ -47,23 +43,49 @@ void* allocate(jlong size) {
 	return resultBuffer;
 }
 
+JNIEXPORT jbyteArray JNICALL GetClassBytes(JNIEnv* env, jclass _, jclass clazz)
+{
+	retransform_callback retransform_callback;
+	callback_map.insert(std::make_pair(clazz, &retransform_callback));
 
-JNIEXPORT jint JNICALL RedefineClass(JNIEnv* env, jclass clazz, jclass classToRedefine, jbyteArray classBytes) {
-	jint error;
+	jclass* classes = (jclass*)allocate(sizeof(jclass));
+	classes[0] = clazz;
+
+	jint err = client->jvmti->RetransformClasses(1, classes);
+
+	if (err > 0)
+	{
+		std::stringstream ss;
+		ss << "jvmti error while getting class bytes: ";
+		ss << err;
+
+		ERROR_LOG(ss.str().c_str());
+		return nullptr;
+	}
+
+	jbyteArray output = env->NewByteArray(retransform_callback.class_data_len);
+	env->SetByteArrayRegion(output, 0, retransform_callback.class_data_len, (jbyte*)retransform_callback.class_data);
+
+	client->jvmti->Deallocate((unsigned char*)classes);
+	return output;
+}
+
+
+JNIEXPORT jint JNICALL RedefineClass(JNIEnv* env, jclass _, jclass clazz, jbyteArray classBytes) {
 	jbyte* classByteArray = env->GetByteArrayElements(classBytes, nullptr);
 	auto* definitions = (jvmtiClassDefinition*)allocate(sizeof(jvmtiClassDefinition));
-	definitions->klass = classToRedefine;
+	definitions->klass = clazz;
 	definitions->class_byte_count = env->GetArrayLength(classBytes);
 	definitions->class_bytes = (unsigned char*)classByteArray;
 
-	error = (jint)client->jvmti->RedefineClasses(1, definitions);
+	jint error = (jint)client->jvmti->RedefineClasses(1, definitions);
 
 	env->ReleaseByteArrayElements(classBytes, classByteArray, 0);
 	client->jvmti->Deallocate((unsigned char*)definitions);
 	return error;
 }
 
-JNIEXPORT void JNICALL UnintializeLoader(JNIEnv* env, jclass clazz)
+JNIEXPORT void JNICALL UnintializeLoader(JNIEnv* env, jclass _)
 {
 	client->done = true;
 }
